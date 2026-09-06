@@ -107,12 +107,58 @@ class MultiServer(commands.Cog):
         if self._original_process_dm is not None:
             self.bot.process_dm_modmail = self._original_process_dm
 
-    def _configured_guilds_for(self, user_id: int) -> list[discord.Guild]:
-        guilds = []
-        for guild_id in self.source_guild_ids:
+    async def _configured_guilds_for(self, user_id: int) -> list[discord.Guild]:
+        """Return source guilds the user is actually a member of.
+
+        get_member() only checks discord.py's local member cache and can return
+        None even when the user is in the server. Fall back to fetch_member()
+        so DM routing does not depend on the member cache being populated.
+        """
+        guilds: list[discord.Guild] = []
+
+        # Treat every guild the bot is currently in as eligible except the
+        # central staff/modmail guild. Explicitly configured guild IDs are
+        # also retained for compatibility with the management commands.
+        candidate_ids = set(self.source_guild_ids)
+        candidate_ids.update(
+            guild.id
+            for guild in self.bot.guilds
+            if self.bot.modmail_guild is None or guild.id != self.bot.modmail_guild.id
+        )
+
+        for guild_id in candidate_ids:
             guild = self.bot.get_guild(guild_id)
-            if guild and guild.get_member(user_id):
+            if guild is None:
+                continue
+            if self.bot.modmail_guild and guild.id == self.bot.modmail_guild.id:
+                continue
+
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.NotFound:
+                    member = None
+                except discord.Forbidden:
+                    log.warning(
+                        "Could not check membership for user %s in guild %s (%s): forbidden.",
+                        user_id,
+                        guild.name,
+                        guild.id,
+                    )
+                    member = None
+                except discord.HTTPException:
+                    log.exception(
+                        "Could not check membership for user %s in guild %s (%s).",
+                        user_id,
+                        guild.name,
+                        guild.id,
+                    )
+                    member = None
+
+            if member is not None:
                 guilds.append(guild)
+
         return sorted(guilds, key=lambda guild: guild.name.casefold())
 
     async def _stored_guild_id(self, user_id: int, thread: Optional[Thread]) -> Optional[int]:
@@ -164,14 +210,14 @@ class MultiServer(commands.Cog):
                 guild_id = await self._stored_guild_id(message.author.id, thread)
 
                 if thread is None:
-                    guilds = self._configured_guilds_for(message.author.id)
+                    guilds = await self._configured_guilds_for(message.author.id)
                     guild_id = await self._choose_source(message, guilds)
                     if guild_id is None:
                         return
                     await self._save_thread_source(message.author.id, guild_id)
                 elif guild_id is None:
                     # Compatibility for threads created before this plugin was installed.
-                    guilds = self._configured_guilds_for(message.author.id)
+                    guilds = await self._configured_guilds_for(message.author.id)
                     if len(guilds) == 1:
                         guild_id = guilds[0].id
                         await self._save_thread_source(message.author.id, guild_id)
@@ -189,10 +235,28 @@ class MultiServer(commands.Cog):
         guild = self.bot.get_guild(guild_id)
         guild_name = guild.name if guild else "Unknown/Unavailable Server"
         member = guild.get_member(thread.id) if guild else None
+        if guild and member is None:
+            try:
+                member = await guild.fetch_member(thread.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
 
-        topic_lines = [f"User ID: {thread.id}", f"Source Server: {guild_name}", f"Source Server ID: {guild_id}"]
         try:
-            await thread.channel.edit(topic="\n".join(topic_lines), reason="Record Modmail source server")
+            existing_topic = thread.channel.topic or ""
+            preserved_lines = [
+                line
+                for line in existing_topic.splitlines()
+                if not line.startswith("Source Server:")
+                and not line.startswith("Source Server ID:")
+            ]
+            preserved_lines.extend(
+                [
+                    f"Source Server: {guild_name}",
+                    f"Source Server ID: {guild_id}",
+                ]
+            )
+            topic = "\n".join(line for line in preserved_lines if line).strip()
+            await thread.channel.edit(topic=topic[:1024], reason="Record Modmail source server")
         except discord.HTTPException:
             log.exception("Could not add the source server to thread %s's topic.", thread.id)
 
